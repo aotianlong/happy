@@ -330,6 +330,31 @@ import { handleCodexCommand } from './commands/codexCommand'
       process.exit(1)
     }
     return;
+  } else if (subcommand === 'cursor-agent') {
+    try {
+      let startedBy: 'daemon' | 'terminal' | undefined = undefined;
+      let model: string | undefined = undefined;
+      for (let i = 1; i < args.length; i++) {
+        if (args[i] === '--started-by') {
+          startedBy = args[++i] as 'daemon' | 'terminal';
+        } else if (args[i] === '--model') {
+          model = args[++i];
+        }
+      }
+
+      const { credentials } = await authAndSetupMachineIfNeeded();
+      await ensureDaemonRunning();
+
+      const { runCursorAgent } = await import('@/cursor-agent/runCursorAgent');
+      await runCursorAgent({ credentials, startedBy, model });
+    } catch (error) {
+      console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
+      if (process.env.DEBUG) {
+        console.error(error)
+      }
+      process.exit(1)
+    }
+    return;
   } else if (subcommand === 'acp') {
     try {
       const { runAcp, resolveAcpAgentConfig } = await import('@/agent/acp');
@@ -653,6 +678,7 @@ ${chalk.bold('Usage:')}
   happy resume            Resume a previous Happy session by Happy session ID
   happy codex             Start Codex mode
   happy gemini            Start Gemini mode (ACP)
+  happy cursor-agent      Start Cursor Agent mode
   happy acp               Start a generic ACP-compatible agent
   happy connect           Connect AI vendor API keys
   happy sandbox           Configure and manage OS-level sandboxing
@@ -672,6 +698,9 @@ ${chalk.bold('Examples:')}
   happy --js-runtime bun   Use bun instead of node to spawn Claude Code
   happy --claude-env ANTHROPIC_BASE_URL=http://127.0.0.1:3456
                            Use a custom API endpoint (e.g., claude-code-router)
+  happy cursor-agent       Start Cursor Agent (default model)
+  happy cursor-agent --model composer-1
+                           Start Cursor Agent with specific model
   happy acp gemini         Start Gemini via generic ACP runner
   happy acp -- opencode --acp
                            Start a custom ACP command

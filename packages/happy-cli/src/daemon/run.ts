@@ -340,8 +340,8 @@ export async function startDaemon(): Promise<void> {
 
           // Construct command for the CLI
           const cliPath = join(projectPath(), 'dist', 'index.mjs');
-          // Determine agent command - support claude, codex, and gemini
-          const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : (options.agent === 'openclaw' ? 'openclaw' : 'claude'));
+          // Determine agent command - support claude, codex, gemini, and cursor-agent
+          const agent = options.agent === 'gemini' ? 'gemini' : (options.agent === 'codex' ? 'codex' : (options.agent === 'openclaw' ? 'openclaw' : (options.agent === 'cursor-agent' ? 'cursor-agent' : 'claude')));
           const fullCommand = `node --no-warnings --no-deprecation ${cliPath} ${agent} --happy-starting-mode remote --started-by daemon`;
 
           // Spawn in tmux with environment variables
@@ -424,7 +424,7 @@ export async function startDaemon(): Promise<void> {
         if (!useTmux) {
           logger.debug(`[DAEMON RUN] Using regular process spawning`);
 
-          // Construct arguments for the CLI - support claude, codex, and gemini
+          // Construct arguments for the CLI - support claude, codex, gemini, and cursor-agent
           let agentCommand: string;
           switch (options.agent) {
             case 'claude':
@@ -439,6 +439,9 @@ export async function startDaemon(): Promise<void> {
               break;
             case 'openclaw':
               agentCommand = 'openclaw';
+              break;
+            case 'cursor-agent':
+              agentCommand = 'cursor-agent';
               break;
             default:
               return {
