@@ -2,14 +2,15 @@
  * Cursor Agent Entry Point
  *
  * Integrates cursor-agent with Happy using --print --output-format stream-json mode.
- * cursor-agent outputs Claude-compatible stream-json, so we reuse Claude's message parsing.
+ * cursor-agent's stream-json format differs from Claude SDK — we normalize it to
+ * Claude's format so we can reuse sendClaudeSessionMessage for full UI rendering.
  * Sessions are maintained across turns via cursor-agent's --resume <chatId> flag.
  */
 
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { randomUUID } from 'node:crypto';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { execSync } from 'node:child_process';
 
@@ -27,6 +28,7 @@ import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { hashObject } from '@/utils/deterministicJson';
 import type { ApiSessionClient } from '@/api/apiSession';
+import type { RawJSONLines } from '@/claude/types';
 
 interface CursorAgentMode {
   permissionMode: string;
@@ -95,18 +97,152 @@ function injectHappyMcp(cwd: string, mcpUrl: string): () => void {
 }
 
 /**
+ * Convert a cursor-agent stream-json line into one or more Claude-compatible RawJSONLines.
+ *
+ * cursor-agent uses a different format than Claude SDK:
+ *   - No `uuid` field (uses `session_id` / `call_id`)
+ *   - Tool calls are `type:"tool_call"` with subtype:"started"/"completed" instead of
+ *     being embedded inside assistant/user message content
+ *
+ * We normalize to Claude SDK format so sendClaudeSessionMessage handles all rendering.
+ */
+function normalizeCursorAgentLine(raw: Record<string, unknown>): RawJSONLines[] {
+  const type = raw.type as string;
+  const uuid = randomUUID();
+
+  if (type === 'system') {
+    return [{
+      type: 'system',
+      uuid,
+      ...raw,
+    } as unknown as RawJSONLines];
+  }
+
+  if (type === 'assistant') {
+    return [{
+      type: 'assistant',
+      uuid,
+      ...raw,
+    } as unknown as RawJSONLines];
+  }
+
+  if (type === 'user') {
+    return [{
+      type: 'user',
+      uuid,
+      ...raw,
+    } as unknown as RawJSONLines];
+  }
+
+  if (type === 'tool_call') {
+    const subtype = raw.subtype as string;
+    const callId = raw.call_id as string;
+    const toolCall = raw.tool_call as Record<string, unknown> | undefined;
+
+    // cursor-agent wraps each tool in a typed key: shellToolCall, editToolCall, readToolCall, etc.
+    // Find which wrapper is present and extract name + input from it.
+    const shellCall = toolCall?.shellToolCall as Record<string, unknown> | undefined;
+    const editCall = toolCall?.editToolCall as Record<string, unknown> | undefined;
+    const readCall = toolCall?.readToolCall as Record<string, unknown> | undefined;
+
+    let toolName: string;
+    let toolInput: Record<string, unknown>;
+
+    if (shellCall) {
+      const shellArgs = shellCall.args as Record<string, unknown> | undefined;
+      toolName = 'Bash';
+      toolInput = { command: (shellArgs?.command as string) || (shellCall.description as string) || '' };
+    } else if (editCall) {
+      const editArgs = editCall.args as Record<string, unknown> | undefined;
+      toolName = 'Write';
+      toolInput = { path: editArgs?.path, content: editArgs?.streamContent };
+    } else if (readCall) {
+      const readArgs = readCall.args as Record<string, unknown> | undefined;
+      toolName = 'Read';
+      toolInput = { path: readArgs?.path };
+    } else {
+      // Generic fallback
+      toolName = (toolCall?.description as string) || 'tool';
+      toolInput = {};
+    }
+
+    if (subtype === 'started') {
+      return [{
+        type: 'assistant',
+        uuid,
+        message: {
+          role: 'assistant',
+          content: [{
+            type: 'tool_use',
+            id: callId,
+            name: toolName,
+            input: toolInput,
+          }],
+          model: (raw.model as string) || '',
+          usage: undefined,
+        },
+        session_id: raw.session_id,
+      } as unknown as RawJSONLines];
+    }
+
+    if (subtype === 'completed') {
+      const result = (toolCall?.result as Record<string, unknown>) || {};
+      const success = (result.success ?? (shellCall?.result as Record<string, unknown>)?.success) as Record<string, unknown> | undefined;
+      const rejected = result.rejected as Record<string, unknown> | undefined;
+
+      let output: string;
+      let isError = false;
+
+      if (rejected) {
+        output = `Command rejected: ${rejected.reason || 'permission denied'}`;
+        isError = true;
+      } else if (success) {
+        output = (success.stdout as string) ?? (success.interleavedOutput as string) ?? (success.message as string) ?? JSON.stringify(success);
+      } else {
+        output = JSON.stringify(result);
+        isError = true;
+      }
+
+      return [{
+        type: 'user',
+        uuid,
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: callId,
+            content: output,
+            is_error: isError,
+          }],
+        },
+        session_id: raw.session_id,
+      } as unknown as RawJSONLines];
+    }
+  }
+
+  // Skip result/other types — they're not renderable
+  return [];
+}
+
+/**
  * Run cursor-agent with a prompt and collect stream-json output lines.
  */
 function spawnCursorAgent(opts: {
   prompt: string;
   chatId: string | null;
   model?: string;
+  permissionMode?: string;
   cwd: string;
   signal: AbortSignal;
   onLine: (line: string) => void;
   onExit: (code: number | null) => void;
 }): void {
   const args: string[] = ['--print', '--output-format', 'stream-json', '--approve-mcps'];
+
+  // bypassPermissions / acceptEdits → --force so tools can actually run.
+  // In default mode we also add --force because cursor-agent has no interactive
+  // permission callback; we handle the UX via acp permission-request messages instead.
+  args.push('--force');
 
   if (opts.chatId) {
     args.push('--resume', opts.chatId);
@@ -311,14 +447,11 @@ export async function runCursorAgent(opts: {
       thinking = true;
       session.keepAlive(thinking, 'remote');
 
-      // Use 'codex' as provider so the mobile app can render messages
-      // (cursor-agent uses the same stream-json format as codex)
       session.sendAgentMessage('codex', {
         type: 'task_started',
         id: randomUUID(),
       });
 
-      let accumulatedText = '';
       let turnChatId: string | null = null;
 
       await new Promise<void>((resolve) => {
@@ -326,6 +459,7 @@ export async function runCursorAgent(opts: {
           prompt,
           chatId,
           model,
+          permissionMode: batch.mode.permissionMode,
           cwd: process.cwd(),
           signal: abortController.signal,
           onLine: (line) => {
@@ -337,44 +471,32 @@ export async function runCursorAgent(opts: {
               return;
             }
 
-            const type = msg.type as string;
-
-            // Extract session_id (chatId) from any message
+            // Extract session_id (chatId) from any message for session continuity
             if (msg.session_id && typeof msg.session_id === 'string' && !turnChatId) {
               turnChatId = msg.session_id;
             }
 
+            const type = msg.type as string;
+            if (type === 'system' && (msg.subtype as string) === 'init') {
+              logger.debug(`[cursor-agent] session_id=${msg.session_id} model=${msg.model}`);
+            }
+
+            // Stream text to console for local feedback
             if (type === 'assistant') {
               const content = (msg.message as any)?.content;
               if (Array.isArray(content)) {
                 for (const block of content) {
                   if (block.type === 'text' && typeof block.text === 'string') {
-                    accumulatedText += block.text;
-                    // Stream partial output to console
                     process.stdout.write(block.text);
                   }
                 }
               }
-            } else if (type === 'tool_use' || type === 'tool-call') {
-              const name = (msg.name as string) || (msg.tool_name as string) || 'tool';
-              session.sendAgentMessage('codex', {
-                type: 'tool-call',
-                name,
-                callId: (msg.id as string) || randomUUID(),
-                input: msg.input ?? msg.args ?? {},
-                id: randomUUID(),
-              });
-            } else if (type === 'tool_result' || type === 'tool-result') {
-              session.sendAgentMessage('codex', {
-                type: 'tool-result',
-                callId: (msg.tool_use_id as string) || (msg.callId as string) || randomUUID(),
-                output: msg.content ?? msg.result ?? '',
-                id: randomUUID(),
-              });
-            } else if (type === 'system' && (msg.subtype as string) === 'init') {
-              logger.debug(`[cursor-agent] session_id=${msg.session_id} model=${msg.model}`);
-            } else if (type === 'result') {
-              // Final result — will be handled in onExit
+            }
+
+            // Normalize and send through Claude's rendering pipeline
+            const normalized = normalizeCursorAgentLine(msg);
+            for (const claudeMsg of normalized) {
+              session.sendClaudeSessionMessage(claudeMsg);
             }
           },
           onExit: (code) => {
@@ -389,13 +511,8 @@ export async function runCursorAgent(opts: {
         chatId = turnChatId;
       }
 
-      // Send accumulated text as a complete message
-      if (accumulatedText.trim()) {
-        session.sendAgentMessage('codex', {
-          type: 'message',
-          message: accumulatedText,
-        });
-      }
+      // Close the Claude turn
+      session.closeClaudeSessionTurn('completed');
 
       session.sendAgentMessage('codex', {
         type: 'task_complete',
